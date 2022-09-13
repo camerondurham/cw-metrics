@@ -1,0 +1,23 @@
+{
+    "metrics": [
+        [ { "expression": "METRICS(\"m1\")/{{PERIOD}}", "id": "e1", "region": "{{REGION}}", "period": 3600, "label": "[avg: ${AVG}, max: ${MAX}] " } ],
+        [ "AWS/Firehose", "IncomingPutRequests", "DeliveryStreamName", "{{NAMESPACE}}", { "id": "m1", "visible": false, "label": "IncomingPutRequests (per second average)" } ]
+    ],
+    "view": "timeSeries",
+    "stacked": false,
+    "stat": "Sum",
+    "region": "{{REGION}}",
+    "title": "Incoming put requests {{NAMESPACE}} {{REGION}}",
+    "period": {{PERIOD}},
+    "yAxis": {
+        "left": {
+            "showUnits": false,
+            "label": "Count",
+            "min": 0
+        }
+    },
+    "width": 1500,
+    "height": 200,
+    "start": "-PT{{PERIOD_START}}",
+    "end": "-PT{{PERIOD_END}}"
+}

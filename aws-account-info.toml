@@ -1,0 +1,18 @@
+###############################################################################
+
+[[account]]
+namespace = "SchemaOneDPP"
+account_id = "111111111111"
+region = "us-east-1"
+
+[[account]]
+namespace = "SchemaOneDPP"
+account_id = "222222222222"
+region = "eu-west-1"
+
+[[account]]
+namespace = "SchemaOneDPP"
+account_id = "333333333333"
+region = "us-west-2"
+
+###############################################################################
