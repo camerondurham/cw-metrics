@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use aws_sdk_cloudwatch::{Client as cloudwatchClient, Error, PKG_VERSION};
+use aws_sdk_sts::Client as stsClient;
 use clap::{Arg, Command};
-
-use aws_config::meta::region::RegionProviderChain;
-use aws_sdk_cloudwatch::{Client, Error, Region, PKG_VERSION};
 use serde::Deserialize;
 use tokio::fs;
 
@@ -18,47 +18,77 @@ struct AccountConfig {
     namespace: String,
     account_id: String,
     region: String,
+    role_arn: String,
 }
 
 #[derive(Debug)]
 struct GetWidgetProps {
-    region: Option<String>,
-
     app_name: String,
-
-    title: String,
-
-    verbose: bool,
-
-    template_path: PathBuf,
-
-    start: String,
-
     end: String,
-
     period: String,
+    region: Option<String>,
+    role_arn: String,
+    start: String,
+    template_path: PathBuf,
+    title: String,
+    verbose: bool,
+}
+
+pub mod aws_regions {
+
+    pub trait AWSRegionName {
+        fn name(self: Self) -> &'static str;
+    }
+
+    impl AWSRegionName for AirportCode {
+        fn name(self: Self) -> &'static str {
+            match self {
+                AirportCode::IAD => "us-east-1",
+                AirportCode::PDX => "us-west-2",
+                AirportCode::DUB => "eu-west-1",
+            }
+        }
+    }
+
+    // this is dumb, not sure how to force provide a static string in this case though...
+    pub fn convert_to_name(region: &str) -> &'static str {
+        match region {
+            "us-east-1" => "us-east-1",
+            "us-west-2" => "us-west-2",
+            "eu-west-1" => "eu-west-1",
+            _ => "us-west-2",
+        }
+    }
+
+    /// AirportCode enum represents the 3-letter international airport code closest to a data center region
+    #[derive(Debug, Copy, Clone)]
+    pub enum AirportCode {
+        IAD,
+        PDX,
+        DUB,
+    }
 }
 
 /// Dev CLI for repetitive AWS account tasks
 ///
 /// ## Accounts Config
-/// 
+///
 /// The accounts are defined in [TOML](https://toml.io) syntax. The file should be a list of tables containing `namespace`, `account_id`, and `region` for each account.
-/// 
+///
 /// Example (from the repo's accounts.toml):
-/// 
+///
 /// ```toml
 /// [[account]]
 /// namespace = "SomeDataProcessingProgram"
 /// account_id = "111111111111"
 /// region = "us-east-1"
 /// ```
-/// 
+///
 /// To validate accounts config is parsed properly:
-/// 
+///
 /// ```bash
 /// cargo run -- config <ACCOUNT.TOML FILE>
-/// 
+///
 /// # example
 /// cargo run -- config accounts.toml
 /// AccountConfig { namespace: "SomeDataProcessingProgram", account_id: "111111111111", region: "us-east-1" }
@@ -66,15 +96,15 @@ struct GetWidgetProps {
 /// AccountConfig { namespace: "SomeDataProcessingProgram", account_id: "222222222222", region: "us-west-2" }
 /// ...
 /// ```
-/// 
+///
 /// ## Commands
-/// 
+///
 /// You can use `cargo run --` to build and pass commands to the CLI.
-/// 
+///
 /// ```bash
 /// # run retry counts, replace START_TIME in retry-counts graph to start 6 months ago
 /// cargo run -- images --period 3600 --pattern ItemDPP -s 4320H ./resources/traffic.json ../accounts.toml
-/// 
+///
 /// # omit the pattern to run this command for all accounts
 /// cargo run -- images --period 3600  -s 7200H ./resources/traffic.json ../accounts.toml
 /// ```
@@ -169,11 +199,11 @@ async fn main() -> Result<(), Error> {
             let accounts = filter_accounts(pattern, accounts);
 
             for acc in accounts {
-                load_creds(&acc);
                 let props = GetWidgetProps {
                     title: String::from(title),
                     region: Some(acc.region),
                     app_name: acc.namespace,
+                    role_arn: acc.role_arn,
                     template_path: PathBuf::from(template_path),
                     start: String::from(start),
                     end: String::from(end),
@@ -189,7 +219,7 @@ async fn main() -> Result<(), Error> {
         Some(("show", show_matches)) => {
             println!("show: {:?}", show_matches);
 
-            let client = get_client(Some(String::from("us-west-2"))).await;
+            let client = get_cw_client("us-west-2", true).await;
             let res = show_metrics(&client).await;
             if res.is_err() {
                 println!("encountered error getting metrics: {:?}", res.err());
@@ -226,45 +256,115 @@ fn filter_accounts(pattern: Option<&str>, accounts: Option<AccountsConfig>) -> V
     }
 }
 
-async fn get_client(region: Option<String>) -> Client {
-    let region_provider = RegionProviderChain::first_try(region.map(Region::new))
-        .or_default_provider()
-        .or_else(Region::new("us-west-2"));
-    let shared_config = aws_config::from_env().region(region_provider).load().await;
-    Client::new(&shared_config)
-}
-
-async fn cloudwatch_image_download(opts: GetWidgetProps) -> Result<(), Error> {
-    let GetWidgetProps {
-        title,
-        region,
-        app_name: namespace,
-        verbose,
-        template_path: filepath,
-        start,
-        end,
-        period,
-    } = opts;
-
-    let replaced_region = region.clone().unwrap_or_else(|| String::from("us-west-2"));
-
-    let region_provider = RegionProviderChain::first_try(region.clone().map(Region::new))
-        .or_default_provider()
-        .or_else(Region::new("us-west-2"));
+async fn get_cw_client(region: &str, verbose: bool) -> cloudwatchClient {
+    let static_region = aws_regions::convert_to_name(region);
 
     if verbose {
         println!();
         println!("CloudWatch client version: {}", PKG_VERSION);
-        println!(
-            "Region:                    {}",
-            region_provider.region().await.unwrap().as_ref()
-        );
+        println!("Region:                    {}", static_region);
         println!();
     }
 
-    // let shared_config = aws_config::from_env().region(region_provider).load().await;
-    // let client = Client::new(&shared_config);
-    let client = get_client(region).await;
+    let shared_config = aws_config::from_env().region(static_region).load().await;
+
+    if verbose {
+        println!();
+        println!("SdkConfig: {:?}", shared_config);
+        println!();
+    }
+
+    cloudwatchClient::new(&shared_config)
+}
+
+async fn get_cw_client_with_role(
+    region: &str,
+    role_arn: &str,
+    sts_client: &stsClient,
+    verbose: bool,
+) -> cloudwatchClient {
+    let static_region = aws_regions::convert_to_name(region);
+
+    if verbose {
+        println!();
+        println!("Client versions: {}", PKG_VERSION);
+        println!("Region:                    {}", static_region);
+        println!("Role Arn:                  {}", role_arn);
+        println!();
+    }
+
+    let assumed_role = sts_client
+        .assume_role()
+        .role_arn(role_arn)
+        .role_session_name("dev-cli")
+        .send()
+        .await
+        .unwrap();
+
+    let creds = aws_types::Credentials::new(
+        assumed_role.credentials().unwrap().access_key_id().unwrap(),
+        assumed_role
+            .credentials()
+            .unwrap()
+            .secret_access_key()
+            .unwrap(),
+        Some(
+            assumed_role
+                .credentials()
+                .unwrap()
+                .session_token()
+                .unwrap()
+                .into(),
+        ),
+        Some(std::time::UNIX_EPOCH + Duration::from_secs(1800)),
+        "debug tester",
+    );
+
+    let shared_config = aws_config::from_env()
+        .region(static_region) // specify the region again for this specific account, need to make sure this matches the account's infrastructure region
+        .credentials_provider(creds)
+        .load()
+        .await;
+    cloudwatchClient::new(&shared_config)
+}
+
+async fn get_sts_client(region: &str, verbose: bool) -> stsClient {
+    let static_region = aws_regions::convert_to_name(region);
+
+    if verbose {
+        println!();
+        println!("CloudWatch client version: {}", PKG_VERSION);
+        println!("Region:                    {}", static_region);
+        println!();
+    }
+
+    let shared_config = aws_config::from_env().region(static_region).load().await;
+    stsClient::new(&shared_config)
+}
+
+async fn cloudwatch_image_download(opts: GetWidgetProps) -> Result<(), Error> {
+    let GetWidgetProps {
+        app_name: namespace,
+        end,
+        period,
+        region,
+        role_arn,
+        start,
+        template_path: filepath,
+        title,
+        verbose,
+    } = opts;
+
+    let replaced_region = region.clone().unwrap_or_else(|| String::from("us-west-2"));
+
+    let sts_client = get_sts_client(&replaced_region.as_str(), verbose).await;
+    let client = get_cw_client_with_role(
+        &replaced_region.as_str(),
+        role_arn.as_str(),
+        &sts_client,
+        verbose,
+    )
+    .await;
     if let Some(metrics) = get_metrics_json(
         &filepath,
         &replaced_region,
@@ -297,7 +397,6 @@ fn get_accounts(filepath: &str, verbose: bool) -> Option<AccountsConfig> {
         let accounts_config: AccountsConfig =
             toml::from_str(&contents).expect("unable to parse as toml");
         if verbose {
-            // println!("parsed config toml: \n {:?}", &accounts_config);
             for acc in &accounts_config.account {
                 println!("{:?}", acc)
             }
@@ -409,8 +508,4 @@ async fn get_metric_image(
         println!("error getting metric image");
     }
     Ok(())
-}
-
-fn load_creds(account: &AccountConfig) {
-	todo!();
 }
