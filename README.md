@@ -40,3 +40,7 @@ cargo run -- images --period 3600 --pattern ItemDPP -s 4320H ./resources/traffic
 # omit the pattern to run this command for all accounts
 cargo run -- images --period 3600  -s 7200H ./resources/traffic.json ./accounts.toml
 ```
+
+## Future work
+
+- Calculate exact metric statistics with [GetMetricStatistics](https://docs.rs/aws-sdk-cloudwatch/latest/aws_sdk_cloudwatch/client/fluent_builders/struct.GetMetricStatistics.html)
