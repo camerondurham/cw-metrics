@@ -1,11 +1,12 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use aws_sdk_cloudwatch::model::{ComparisonOperator, MetricAlarm, Statistic};
 use aws_sdk_cloudwatch::{Client as cloudwatchClient, Error, PKG_VERSION};
 use aws_sdk_sts::Client as stsClient;
 use clap::{Arg, Command};
-use serde::Deserialize;
 use tokio::fs;
 
 #[derive(Deserialize, Debug)]
@@ -31,6 +32,28 @@ struct GetWidgetProps {
     start: String,
     template_path: PathBuf,
     title: String,
+    verbose: bool,
+}
+
+#[derive(Serialize, Debug)]
+struct MetricAlarmDetails {
+    program_name: String,
+    alarm_name: String,
+    alarm_arn: String,
+    alarm_description: String,
+    dimensions: Vec<String>,
+    actions_enabled: bool,
+    period: i32,
+    threshold: f64,
+    comparison_operator: String,
+    treat_missing_data: String,
+    statistic: String,
+}
+
+#[derive(Debug)]
+struct DescribeAlarmsProps {
+    region: Option<String>,
+    role_arn: String,
     verbose: bool,
 }
 
@@ -108,12 +131,26 @@ pub mod aws_regions {
 /// # omit the pattern to run this command for all accounts
 /// cargo run -- images --period 3600  -s 7200H ./resources/traffic.json ../accounts.toml
 /// ```
-
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     tracing_subscriber::fmt::init();
 
     let matches = Command::new("dev")
+        .subcommand(
+            Command::new("alarms")
+                .about("describe alarms for all accounts")
+                .arg(
+                    Arg::new("pattern")
+                        .long("pattern")
+                        .takes_value(true)
+                        .short('f'),
+                )
+                .arg(
+                    Arg::new("config-path")
+                        .required(true)
+                        .help("the path to the TOML config file with accounts"),
+                ),
+        )
         .subcommand(
             Command::new("images")
                 .about("download metric widget images from CloudWatch")
@@ -225,6 +262,84 @@ async fn main() -> Result<(), Error> {
                 println!("encountered error getting metrics: {:?}", res.err());
             }
         }
+        Some(("alarms", alarm_matches)) => {
+            let pattern = alarm_matches.value_of("pattern");
+            let config_path = alarm_matches.value_of("config-path").unwrap();
+            let accounts = get_accounts(config_path, true);
+            let accounts = filter_accounts(pattern, accounts);
+            let mut all_metrics: Vec<MetricAlarmDetails> = vec![];
+            for acc in accounts {
+                println!("account: {:?}", acc);
+                let props = DescribeAlarmsProps {
+                    region: Some(acc.region),
+                    role_arn: acc.role_arn,
+                    verbose: true,
+                };
+                match cloudwatch_describe_alarms(props).await {
+                    Ok(res) => {
+                        println!("successful query");
+                        for item in res {
+                            let comparison = match item.comparison_operator().unwrap() {
+                                ComparisonOperator::GreaterThanOrEqualToThreshold => {
+                                    "GreaterThanOrEqualToThreshold"
+                                }
+                                ComparisonOperator::GreaterThanThreshold => "GreaterThanThreshold",
+                                ComparisonOperator::LessThanThreshold => "LessThanThreshold",
+                                ComparisonOperator::LessThanOrEqualToThreshold => {
+                                    "LessThanOrEqualToThreshold"
+                                }
+                                _ => "Unknown",
+                            };
+                            let statistic = match item.statistic() {
+                                Some(some) => match some {
+                                    Statistic::Average => "Average",
+                                    Statistic::Maximum => "Maximum",
+                                    Statistic::Minimum => "Minimum",
+                                    Statistic::SampleCount => "SampleCount",
+                                    Statistic::Sum => "Sum",
+                                    _ => "Unknown",
+                                },
+                                None => "",
+                            };
+                            all_metrics.push(MetricAlarmDetails {
+                                program_name: acc.namespace.clone(),
+                                alarm_name: String::from(item.alarm_name().unwrap_or_default()),
+                                alarm_arn: String::from(item.alarm_arn().unwrap_or_default()),
+                                alarm_description: String::from(
+                                    item.alarm_description().unwrap_or_default(),
+                                ),
+                                dimensions: item
+                                    .dimensions()
+                                    .unwrap()
+                                    .iter()
+                                    .map(|i| String::from(i.name().unwrap()))
+                                    .collect(),
+                                actions_enabled: item.actions_enabled().unwrap_or_default(),
+                                period: item.period().unwrap_or_default(),
+                                threshold: item.threshold().unwrap_or_default(),
+                                comparison_operator: String::from(comparison),
+                                treat_missing_data: String::from(
+                                    item.treat_missing_data().unwrap_or_default(),
+                                ),
+                                statistic: String::from(statistic),
+                            });
+                        }
+                    }
+                    Err(e) => println!("failed describe alarms error: {:?}", e),
+                }
+            }
+            let path = Path::new("describe-alarms").with_extension("json");
+            let as_str = serde_json::to_string(&all_metrics).unwrap();
+            let res = fs::write(path, as_str).await;
+            match res {
+                Ok(()) => {
+                    println!("saved metrics");
+                }
+                Err(e) => {
+                    println!("error writing to file: {:?}", e);
+                }
+            }
+        }
         Some(("config", config)) => {
             let config_path = config.value_of("config-path").unwrap();
             let pattern = config.value_of("pattern");
@@ -277,6 +392,20 @@ async fn get_cw_client(region: &str, verbose: bool) -> cloudwatchClient {
     cloudwatchClient::new(&shared_config)
 }
 
+async fn get_sts_client(region: &str, verbose: bool) -> stsClient {
+    let static_region = aws_regions::convert_to_name(region);
+
+    if verbose {
+        println!();
+        println!("CloudWatch client version: {}", PKG_VERSION);
+        println!("Region:                    {}", static_region);
+        println!();
+    }
+
+    let shared_config = aws_config::from_env().region(static_region).load().await;
+    stsClient::new(&shared_config)
+}
+
 async fn get_cw_client_with_role(
     region: &str,
     role_arn: &str,
@@ -317,7 +446,7 @@ async fn get_cw_client_with_role(
                 .into(),
         ),
         Some(std::time::UNIX_EPOCH + Duration::from_secs(1800)),
-        "debug tester",
+        "dev-cli-metrics-observer",
     );
 
     let shared_config = aws_config::from_env()
@@ -328,18 +457,22 @@ async fn get_cw_client_with_role(
     cloudwatchClient::new(&shared_config)
 }
 
-async fn get_sts_client(region: &str, verbose: bool) -> stsClient {
-    let static_region = aws_regions::convert_to_name(region);
-
-    if verbose {
-        println!();
-        println!("CloudWatch client version: {}", PKG_VERSION);
-        println!("Region:                    {}", static_region);
-        println!();
-    }
-
-    let shared_config = aws_config::from_env().region(static_region).load().await;
-    stsClient::new(&shared_config)
+async fn cloudwatch_describe_alarms(opts: DescribeAlarmsProps) -> Result<Vec<MetricAlarm>, Error> {
+    let DescribeAlarmsProps {
+        region,
+        role_arn,
+        verbose,
+    } = opts;
+    let replaced_region = region.clone().unwrap_or_else(|| String::from("us-west-2"));
+    let sts_client = get_sts_client(&replaced_region.as_str(), verbose).await;
+    let client = get_cw_client_with_role(
+        &replaced_region.as_str(),
+        role_arn.as_str(),
+        &sts_client,
+        verbose,
+    )
+    .await;
+    describe_alarms(&client).await
 }
 
 async fn cloudwatch_image_download(opts: GetWidgetProps) -> Result<(), Error> {
@@ -471,6 +604,17 @@ async fn show_metrics(
     println!("Found {} metrics.", num_metrics);
 
     Ok(())
+}
+
+async fn describe_alarms(
+    client: &aws_sdk_cloudwatch::Client,
+) -> Result<Vec<MetricAlarm>, aws_sdk_cloudwatch::Error> {
+    println!("describing alarms");
+    let request = client.describe_alarms();
+    let resp = request.send().await?;
+    let alarms = resp.metric_alarms().unwrap();
+    let vec: Vec<MetricAlarm> = alarms.to_vec();
+    Ok(vec)
 }
 
 /// Calls AWS CloudWatch GetMetricImage API and downloads locally

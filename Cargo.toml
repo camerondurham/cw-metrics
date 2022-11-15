@@ -15,5 +15,6 @@ aws-sdk-config= "0.19.0"
 clap = "3.1"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3.5", features = ["env-filter"]}
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0.2", features = ["derive"] }
+serde_json = {version = "1.0.2", fatures = ["derive"] }
 toml = "0.4.2"
