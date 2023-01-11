@@ -18,3 +18,6 @@ tracing-subscriber = { version = "0.3.5", features = ["env-filter"]}
 serde = { version = "1.0.2", features = ["derive"] }
 serde_json = {version = "1.0.2", fatures = ["derive"] }
 toml = "0.4.2"
+
+[net]
+git-fetch-with-cli = true
